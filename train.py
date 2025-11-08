@@ -7,8 +7,9 @@ import os
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from model import CASNet
+import random
 
-IMAGE_SIZE = 128
+IMAGE_SIZE = 256
 
 class Dataset(Dataset):
     def __init__(self, root_dir, transform=None):
@@ -19,13 +20,14 @@ class Dataset(Dataset):
         return len(self.files)
 
     def __getitem__(self, idx):
-        img = Image.open(self.files[idx]).convert("L")
+        img = Image.open(self.files[idx])
         if self.transform:
             img = self.transform(img)
         return img
 
 transform = transforms.Compose([
     transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.Lambda(lambda img: img.convert("RGB")),
     transforms.ToTensor()
 ])
 
@@ -37,20 +39,20 @@ test_dataloader = DataLoader(test_dataset, batch_size=4, shuffle=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-img_nf = next(iter(dataloader)).to(device).shape[1]
+img_nf = 3
 model = CASNet(32, img_nf, 8).to(device)
 
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=1e-4)
-num_epochs = 30
 
 test_img = test_dataset[0].unsqueeze(0).to(device)
 
-plt.ion()
-fig, ax = plt.subplots(1, 2, figsize=(10, 4))
 
 os.makedirs("plots", exist_ok=True)
 
+cs_ratio = [0.1, 0.3, 0.5, 0.7, 0.9]
+
+num_epochs = 10
 for epoch in range(1, num_epochs + 1):
     total_loss = 0
     model.train()
@@ -58,7 +60,7 @@ for epoch in range(1, num_epochs + 1):
     for imgs in tqdm(dataloader, desc=f"Epoch {epoch}/{num_epochs}"):
         imgs = imgs.to(device)
         optimizer.zero_grad()
-        outputs = model(imgs, cs_ratio=0.5)
+        outputs = model(imgs, cs_ratio=random.choice(cs_ratio))
         loss = criterion(outputs, imgs)
         loss.backward()
         optimizer.step()
@@ -70,17 +72,10 @@ for epoch in range(1, num_epochs + 1):
     if epoch % 10 == 0 or epoch == 1:
         model.eval()
         with torch.no_grad():
-            output : torch.Tensor = model(test_img, cs_ratio=0.5)
+            output : torch.Tensor = model(test_img, cs_ratio=0.1)
             loss = criterion(output, test_img)
             output_img = output.squeeze().detach().to("cpu", non_blocking=True).numpy()
             target_img = test_img.squeeze().detach().to("cpu", non_blocking=True).squeeze().numpy()
-            ax[0].cla()
-            ax[0].imshow(target_img, cmap="gray")
-            ax[0].set_title("Original")
-            ax[1].cla()
-            ax[1].imshow(output_img, cmap="gray")
-            ax[1].set_title(f"Output--Loss: {loss:.5f}")
-            path = f"plots/epoch_{epoch:03d}.png"
-            plt.savefig(path)
-            plt.pause(0.01)
+
+torch.save(model.state_dict(), "model_weights.pth")
 

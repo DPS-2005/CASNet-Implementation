@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 class ResidualBlock(nn.Module):
-    def __init__(self, num_features, bias=False, k_size=3):
+    def __init__(self, num_features, bias=True, k_size=3):
         super(ResidualBlock, self).__init__()
         self.body = nn.Sequential(
             nn.Conv2d(num_features, num_features, k_size, padding=k_size // 2, bias=bias),
@@ -16,7 +16,7 @@ class ResidualBlock(nn.Module):
         return x + self.body(x)
 
 class SaliencyDetector(nn.Module):
-    def __init__(self, img_features, mid_featres=3, num_res_blocks=3, k_size=3, bias=False):
+    def __init__(self, img_features, mid_featres=3, num_res_blocks=3, k_size=3, bias=True):
         super(SaliencyDetector, self).__init__()
         self.body = nn.Sequential(
             nn.Conv2d(img_features, mid_featres, k_size, padding=k_size // 2, bias=bias),
@@ -129,11 +129,12 @@ class Phase(nn.Module):
 
 
 class CASNet(nn.Module):
-    def __init__(self, block_size, img_features, n_phase = 8):
+    def __init__(self, block_size, img_features, n_phase = 8, gamma = 0.2882):
         super(CASNet, self).__init__()
         self.block_size = block_size
         self.N = block_size * block_size
         self.n_phase = n_phase
+        self.gamma = gamma # sampling proportion
         self.generator = nn.Parameter(torch.randn(self.N, self.N) / self.block_size)
         self.saliency_detector = SaliencyDetector(img_features)
         self.recoverySubnet = Phase(img_features, block_size)
@@ -145,26 +146,41 @@ class CASNet(nn.Module):
         x_unfold = x_unfold.permute(0,2,1).reshape(b*l, self.N, c) # shape b*l, N, c
         return l, x_unfold
 
-    def forward(self, x, cs_ratio):
+    def forward(self, x, cs_ratio, test=False):
         # unfold -> sample -> initialise -> phase by phase recovery -> fold
         # x dimension is b,c,h,w
         # Q dimension is b,1,l
         # generator dimension is N,N
-        saliency_map = self.saliency_detector(x)
-        Q = block_measurement_aggregation(saliency_map, self.block_size, cs_ratio)
         b, c, h, w = x.shape
         N = self.block_size * self.block_size
-        cs_ratio_map = Q.reshape(b, 1, h // self.block_size, w // self.block_size) / self.N
+        qb = round(cs_ratio * self.gamma * N) # uniform measurement per block
         l, x_unfold = self._unfold(x)
-        Q = Q.permute(0,2,1).reshape(b*l, 1)
         phi  = self.generator.unsqueeze(0).repeat(b*l, 1, 1)
-        row_idx = torch.arange(N, device=Q.device).unsqueeze(0).repeat(b*l, 1)
-        mask  = row_idx < Q
-        mask = mask.unsqueeze(2).repeat(1,1, N).float()
-        phi = mask * phi
+        row_idx = torch.arange(N, device=x.device).unsqueeze(0).repeat(b*l, 1)
+        u_mask  = row_idx < qb
+        u_mask = u_mask.unsqueeze(2).repeat(1,1, N).float()
+        u_phi = u_mask*phi
+        y = u_phi.matmul(x_unfold)
+        saliency_map = self.saliency_detector(x)
+        Q = block_measurement_aggregation(saliency_map, self.block_size, cs_ratio)
+        cs_ratio_map = Q.reshape(b, 1, h // self.block_size, w // self.block_size) / self.N
+        Q = Q.permute(0,2,1).reshape(b*l, 1)
+        r_mask = (row_idx >= qb) & (row_idx < Q)
+        r_mask = r_mask.unsqueeze(2).repeat(1,1, N).float()
+        r_phi = r_mask*phi
+        phi = u_phi + r_phi
         phi_T = phi.permute(0,2,1)
         phi_T_phi = phi_T.matmul(phi)
         y = phi.matmul(x_unfold)
+
+        if test:
+            y = phi_T.matmul(y)
+            x0 = phi_T.matmul(y)
+            y = y.permute(0, 2, 1).reshape(b, l, c, N).permute(0, 2, 3, 1).reshape(b, c*N, l)
+            y = nn.functional.fold(y, (h, w), self.block_size, stride=self.block_size)
+            x0 = x0.permute(0, 2, 1).reshape(b, l, c, N).permute(0, 2, 3, 1).reshape(b, c*N, l)
+            x0 = nn.functional.fold(x0, (h, w), self.block_size, stride=self.block_size)
+            return saliency_map, y, x0
         for _ in range(self.n_phase):
             x = self.recoverySubnet(x_unfold, y, cs_ratio_map, phi_T, phi_T_phi, x.shape)
             _, x_unfold = self._unfold(x)
